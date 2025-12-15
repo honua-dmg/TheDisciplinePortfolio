@@ -3,6 +3,8 @@ import pandas as pd
 import sqlite3
 import plotly.graph_objects as go
 from datetime import datetime, date, timedelta
+import shutil
+import os
 
 # --- CONFIGURATION ---
 DB_FILE = "portfolio.db"
@@ -28,6 +30,13 @@ def init_db():
                   tier TEXT, 
                   active BOOLEAN)''')
     
+    # NEW: Bounties Table
+    c.execute('''CREATE TABLE IF NOT EXISTS bounties 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  name TEXT UNIQUE, 
+                  value INTEGER, 
+                  status TEXT)''') # status: 'Open', 'Claimed'
+    
     # SEED DEFAULTS
     c.execute("SELECT count(*) FROM tasks")
     if c.fetchone()[0] == 0:
@@ -43,6 +52,21 @@ def init_db():
         c.executemany("INSERT INTO tasks (name, tier, active) VALUES (?, ?, 1)", defaults)
         conn.commit()
     conn.commit()
+    conn.close()
+
+def undo_last_log():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # Get the last log to show user what they are deleting
+    c.execute("SELECT project, points FROM logs ORDER BY id DESC LIMIT 1")
+    last_row = c.fetchone()
+
+    if last_row:
+        c.execute("DELETE FROM logs WHERE id = (SELECT MAX(id) FROM logs)")
+        conn.commit()
+        st.toast(f"Reverted: {last_row[0]} ({last_row[1]} pts)", icon="↩️")
+    else:
+        st.error("Ledger is empty.")
     conn.close()
 
 def get_active_tasks():
@@ -66,33 +90,57 @@ def manage_task(action, name=None, tier=None):
     conn.commit()
     conn.close()
 
+# --- BOUNTY SYSTEM ---
+def manage_bounty(action, name=None, value=0):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if action == "add":
+        try:
+            c.execute("INSERT INTO bounties (name, value, status) VALUES (?, ?, 'Open')", (name, value))
+            st.toast(f"Bounty '{name}' Posted: {value} PTS", icon="💎")
+        except sqlite3.IntegrityError:
+            st.error("Bounty name already exists!")
+    elif action == "claim":
+        # 1. Mark as claimed
+        c.execute("UPDATE bounties SET status='Claimed' WHERE name=?", (name,))
+        # 2. Get value
+        c.execute("SELECT value FROM bounties WHERE name=?", (name,))
+        val = c.fetchone()[0]
+        # 3. Log the "Trade"
+        timestamp_str = datetime.now().isoformat()
+        c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
+                  (timestamp_str, "Bounty Hunt", 0, val, f"CLAIMED: {name}"))
+        st.balloons()
+        st.success(f"💰 BOUNTY CLAIMED: +{val} PTS")
+    elif action == "delete":
+        c.execute("DELETE FROM bounties WHERE name=?", (name,))
+    conn.commit()
+    conn.close()
+
+def get_open_bounties():
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql("SELECT name, value FROM bounties WHERE status='Open'", conn)
+    conn.close()
+    return df
+
 # --- BOSS BATTLE LOGIC ---
 def check_exam_mode():
-    """Checks if Exam Mode has been activated in the last 72 hours."""
     conn = sqlite3.connect(DB_FILE)
     try:
-        # Look for the specific "System Fee" log
         df = pd.read_sql("SELECT * FROM logs WHERE project='System' AND notes='Exam Mode Activated'", conn)
-    except:
-        return False, None
+    except: return False, None
     conn.close()
-    
     if df.empty: return False, None
-
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     last_activation = df['timestamp'].max()
-    
-    # Check if within 72 hours
     if datetime.now() < (last_activation + timedelta(hours=72)):
         return True, last_activation + timedelta(hours=72)
     return False, None
 
 def activate_exam_mode():
-    """Deducts 50 points and logs the start time."""
     timestamp_str = datetime.now().isoformat()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Log the fee
     c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
               (timestamp_str, "System", 0, -50, "Exam Mode Activated"))
     conn.commit()
@@ -122,7 +170,6 @@ def get_analytics():
         (this_week['duration'] >= 90)
     ].shape[0]
 
-    # SOCIAL EMA
     social_logs = df[df['project'].isin(social_projects)].copy()
     daily_social = social_logs.groupby(social_logs['timestamp'].dt.date)['points'].sum().reset_index()
     all_dates = pd.date_range(start=df['timestamp'].min().date(), end=today)
@@ -141,22 +188,14 @@ def get_analytics():
 def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
     points = 0
     current_hour = datetime.now().hour
-    
-    # CHECK EXAM MODE
     is_exam_mode, _ = check_exam_mode()
-
-    # 1. SLEEP MULTIPLIER
-    multiplier = 1.0
-    if sleep_hours < 5:
-        multiplier = 0.5; notes += " (ZOMBIE TAX -50%)"
-    elif sleep_hours < 6.5:
-        multiplier = 0.8; notes += " (TIRED TAX -20%)"
     
-    # 2. VAMPIRE RULE (Smart + Exam Mode Exception)
+    multiplier = 1.0
+    if sleep_hours < 5: multiplier = 0.5; notes += " (ZOMBIE TAX -50%)"
+    elif sleep_hours < 6.5: multiplier = 0.8; notes += " (TIRED TAX -20%)"
+    
     is_vampire_time = (0 <= current_hour < 6)
     is_exempt_activity = (tier == 'Social') or (project == 'Volleyball')
-    
-    # If Exam Mode is ON, Vampire Rule is OFF
     if is_exam_mode: is_vampire_time = False
 
     if is_vampire_time and not is_exempt_activity:
@@ -181,7 +220,6 @@ def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
         today_logs = df[df['timestamp'].dt.date == date.today()]
         project_logs = today_logs[today_logs['project'] == project]
 
-    # --- SCORING ---
     if tier == "Core":
         already_collected_base = not project_logs[(project_logs['points'] >= 10)].empty
         if duration >= 20 and not already_collected_base:
@@ -199,12 +237,8 @@ def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
         if project_logs.empty: 
             if project == "Volleyball": points = 25 
             else: 
-                # ACADEMICS BONUS IN EXAM MODE
-                if is_exam_mode and project == "Academics":
-                    points = 20 # Double Points!
-                    notes += " (EXAM SURGE)"
-                else:
-                    points = 10
+                if is_exam_mode and project == "Academics": points = 20; notes += " (EXAM SURGE)"
+                else: points = 10
             
     elif tier == "Social":
         base_social_pts = 0
@@ -216,10 +250,7 @@ def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
         if today_social < 40: points = base_social_pts
         else: points = 0; notes += " (Social Cap Hit)"
 
-    # APPLY MULTIPLIER
     final_points = int(points * multiplier)
-
-    # SAVE
     timestamp_str = datetime.now().isoformat()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -233,7 +264,7 @@ def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
 st.set_page_config(page_title="Discipline Portfolio", page_icon="📈", layout="wide")
 init_db()
 
-# 1. SIDEBAR: ASSETS & MODES
+# 1. SIDEBAR
 with st.sidebar.expander("⚙️ Asset Manager"):
     tab1, tab2 = st.tabs(["Add", "Delist"])
     with tab1:
@@ -246,13 +277,49 @@ with st.sidebar.expander("⚙️ Asset Manager"):
         del_task = st.selectbox("Select Asset to Delist", tasks_df['name'].tolist() if not tasks_df.empty else [])
         if st.button("Delist Asset"): manage_task("delete", del_task); st.rerun()
 
-# BOSS BATTLE TOGGLE
+# --- NEW: BOUNTY BOARD TAB ---
+with st.sidebar.expander("🏆 Bounty Board"):
+    b_tab1, b_tab2 = st.tabs(["Post", "Claim"])
+    
+    with b_tab1: # CALCULATOR
+        st.caption("Valuation Model")
+        b_name = st.text_input("Bounty Name", placeholder="e.g. Ship News App")
+        b_hours = st.number_input("Est. Hours", 1, 100, 5)
+        
+        col_b1, col_b2 = st.columns(2)
+        b_fear = col_b1.checkbox("High Fear?", help="+25% Value")
+        b_lev = col_b2.checkbox("Resume Item?", help="+50% Value")
+        
+        # VALUATION FORMULA
+        base_val = b_hours * 20
+        multiplier = 1.0
+        if b_fear: multiplier += 0.25
+        if b_lev: multiplier += 0.50
+        
+        final_val = int(base_val * multiplier)
+        st.metric("Fair Value", f"{final_val} PTS")
+        
+        if st.button("Post Bounty"):
+            if b_name: manage_bounty("add", b_name, final_val); st.rerun()
+            
+    with b_tab2: # CLAIM
+        open_bounties = get_open_bounties()
+        if not open_bounties.empty:
+            b_claim = st.selectbox("Select Bounty", open_bounties['name'] + " (" + open_bounties['value'].astype(str) + " pts)")
+            # Extract name back from string
+            real_name = b_claim.split(" (")[0]
+            if st.button("💰 CLAIM REWARD"):
+                manage_bounty("claim", real_name)
+                st.rerun()
+        else:
+            st.info("No active bounties.")
+
+# EXAM MODE
 exam_active, exam_end = check_exam_mode()
 st.sidebar.divider()
 if exam_active:
     st.sidebar.error(f"🔥 EXAM MODE ACTIVE")
     st.sidebar.caption(f"Ends: {exam_end.strftime('%b %d %H:%M')}")
-    st.sidebar.caption("• Vampire Rule OFF\n• Academics 2x PTS")
 else:
     if st.sidebar.button("💀 Activate Exam Mode (-50 Pts)"):
         activate_exam_mode()
@@ -299,11 +366,15 @@ if st.sidebar.button("Log Session"):
         else: st.sidebar.warning("⚠️ No Points")
     else: st.sidebar.error("Create an asset first!")
 
+
+if st.sidebar.button("↩️ Undo Last Trade"):
+    undo_last_log()
+    st.rerun()
+
 # --- DASHBOARD ---
 st.title("📈 The Discipline Portfolio")
 tokens_used, social_ema, current_rent, df = get_analytics()
 
-# TOP METRICS
 col1, col2, col3, col4 = st.columns(4)
 
 if not df.empty:
@@ -354,42 +425,30 @@ with tab1:
 
 with tab2:
     if not df.empty:
-        # HEATMAP LOGIC
-        hm_df = df.copy()
-        hm_df['date'] = hm_df['timestamp'].dt.date
-        # Sum duration per day to measure "Intensity"
-        daily_intensity = hm_df.groupby('date')['duration'].sum().reset_index()
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        start_date = df['timestamp'].min().date() - timedelta(days=df['timestamp'].min().date().weekday())
+        end_date = date.today()
+        all_dates = pd.date_range(start_date, end_date)
         
-        # Calculate Week and DayOfWeek for GitHub style grid
-        # Note: This is a simplified scatter representation
+        daily_intensity = df.groupby(df['timestamp'].dt.date)['duration'].sum().reindex(all_dates, fill_value=0).reset_index()
+        daily_intensity.columns = ['date', 'duration']
+        daily_intensity['week_start'] = daily_intensity['date'] - pd.to_timedelta(daily_intensity['date'].dt.dayofweek, unit='D')
+        daily_intensity['day_num'] = daily_intensity['date'].dt.dayofweek
+        
         fig_hm = go.Figure(data=go.Heatmap(
+            x=daily_intensity['week_start'], 
+            y=daily_intensity['day_num'],
             z=daily_intensity['duration'],
-            x=daily_intensity['date'],
-            y=[1] * len(daily_intensity), # Flat heatmap (Time Series Strip) or true Calendar?
-            colorscale='Greens',
-            showscale=False
+            colorscale=[[0, '#ebedf0'], [0.01, '#9be9a8'], [1.0, '#216e39']],
+            showscale=False, xgap=3, ygap=3, hoverongaps=False,
+            hovertemplate='%{x}<br>%{z} mins<extra></extra>'
         ))
-        
-        # ACTUALLY, A SCATTER BUBBLE CHART LOOKS BETTER FOR CALENDAR
-        # Let's do a GitHub Style grid: X=Week, Y=Day (0-6)
-        daily_intensity['week'] = pd.to_datetime(daily_intensity['date']).dt.isocalendar().week
-        daily_intensity['day_of_week'] = pd.to_datetime(daily_intensity['date']).dt.dayofweek
-        daily_intensity['day_name'] = pd.to_datetime(daily_intensity['date']).dt.strftime("%a")
-        
-        fig_hm = go.Figure(data=go.Scatter(
-            x=daily_intensity['date'],
-            y=daily_intensity['day_name'],
-            mode='markers',
-            marker=dict(
-                size=15,
-                color=daily_intensity['duration'],
-                colorscale='Greens',
-                showscale=True,
-                symbol='square'
-            ),
-            text=daily_intensity['duration'].astype(str) + " mins"
-        ))
-        fig_hm.update_layout(height=250, title="Daily Intensity (Minutes)")
+        fig_hm.update_layout(
+            height=200, margin=dict(l=20, r=20, t=20, b=20),
+            xaxis=dict(showgrid=False, zeroline=False, tickformat='%b %d'),
+            yaxis=dict(tickmode='array', tickvals=[0,1,2,3,4,5,6], ticktext=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'], showgrid=False, zeroline=False, autorange="reversed"),
+            plot_bgcolor='rgba(0,0,0,0)', yaxis_scaleanchor="x"
+        )
         st.plotly_chart(fig_hm, use_container_width=True)
     else:
         st.info("Log data to see heatmap.")
