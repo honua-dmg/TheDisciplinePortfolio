@@ -2,9 +2,9 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import plotly.graph_objects as go
-from datetime import datetime, date, timedelta
 import shutil
 import os
+from datetime import datetime, date, timedelta
 
 # --- CONFIGURATION ---
 DB_FILE = "portfolio.db"
@@ -30,14 +30,12 @@ def init_db():
                   tier TEXT, 
                   active BOOLEAN)''')
     
-    # NEW: Bounties Table
     c.execute('''CREATE TABLE IF NOT EXISTS bounties 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   name TEXT UNIQUE, 
                   value INTEGER, 
-                  status TEXT)''') # status: 'Open', 'Claimed'
+                  status TEXT)''') 
     
-    # SEED DEFAULTS
     c.execute("SELECT count(*) FROM tasks")
     if c.fetchone()[0] == 0:
         defaults = [
@@ -53,21 +51,12 @@ def init_db():
         conn.commit()
     conn.commit()
     conn.close()
-
-def undo_last_log():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # Get the last log to show user what they are deleting
-    c.execute("SELECT project, points FROM logs ORDER BY id DESC LIMIT 1")
-    last_row = c.fetchone()
-
-    if last_row:
-        c.execute("DELETE FROM logs WHERE id = (SELECT MAX(id) FROM logs)")
-        conn.commit()
-        st.toast(f"Reverted: {last_row[0]} ({last_row[1]} pts)", icon="↩️")
-    else:
-        st.error("Ledger is empty.")
-    conn.close()
+    
+    if not os.path.exists("backups"): os.makedirs("backups")
+    today_str = date.today().strftime("%Y-%m-%d")
+    backup_path = f"backups/portfolio_{today_str}.db"
+    if os.path.exists(DB_FILE) and not os.path.exists(backup_path):
+        shutil.copy(DB_FILE, backup_path)
 
 def get_active_tasks():
     conn = sqlite3.connect(DB_FILE)
@@ -90,6 +79,32 @@ def manage_task(action, name=None, tier=None):
     conn.commit()
     conn.close()
 
+# --- NEEDLE MOVER LOGIC ---
+def check_needle_status(target_date=None):
+    if target_date is None: target_date = date.today()
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        df = pd.read_sql("SELECT * FROM logs WHERE project='System' AND notes='Needle Moved'", conn)
+    except: return False
+    conn.close()
+    
+    if df.empty: return False
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    log = df[df['timestamp'].dt.date == target_date]
+    return not log.empty
+
+def set_needle_status(state):
+    if state:
+        timestamp_str = datetime.now().isoformat()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
+                  (timestamp_str, "System", 0, 0, "Needle Moved"))
+        conn.commit()
+        conn.close()
+        st.balloons()
+        st.toast("🚀 BOOM! NEEDLE MOVED!", icon="🔥")
+
 # --- BOUNTY SYSTEM ---
 def manage_bounty(action, name=None, value=0):
     conn = sqlite3.connect(DB_FILE)
@@ -101,12 +116,9 @@ def manage_bounty(action, name=None, value=0):
         except sqlite3.IntegrityError:
             st.error("Bounty name already exists!")
     elif action == "claim":
-        # 1. Mark as claimed
         c.execute("UPDATE bounties SET status='Claimed' WHERE name=?", (name,))
-        # 2. Get value
         c.execute("SELECT value FROM bounties WHERE name=?", (name,))
         val = c.fetchone()[0]
-        # 3. Log the "Trade"
         timestamp_str = datetime.now().isoformat()
         c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
                   (timestamp_str, "Bounty Hunt", 0, val, f"CLAIMED: {name}"))
@@ -144,6 +156,19 @@ def activate_exam_mode():
     c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
               (timestamp_str, "System", 0, -50, "Exam Mode Activated"))
     conn.commit()
+    conn.close()
+
+def undo_last_log():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT project, points FROM logs ORDER BY id DESC LIMIT 1")
+    last_row = c.fetchone()
+    if last_row:
+        c.execute("DELETE FROM logs WHERE id = (SELECT MAX(id) FROM logs)")
+        conn.commit()
+        st.toast(f"Reverted: {last_row[0]} ({last_row[1]} pts)", icon="↩️")
+    else:
+        st.error("Ledger is empty.")
     conn.close()
 
 # --- ANALYTICS ENGINE ---
@@ -184,7 +209,6 @@ def get_analytics():
         
     return tokens, current_social_ema, current_rent, df
 
-# --- LOGGING LOGIC ---
 def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
     points = 0
     current_hour = datetime.now().hour
@@ -264,6 +288,24 @@ def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
 st.set_page_config(page_title="Discipline Portfolio", page_icon="📈", layout="wide")
 init_db()
 
+# --- THE SHAME PROTOCOL (COLOR SCHEME LOGIC) ---
+yesterday_status = check_needle_status(date.today() - timedelta(days=1))
+needle_today = check_needle_status(date.today())
+
+# If you failed yesterday, INJECT RED CSS
+if not yesterday_status:
+    st.markdown("""
+        <style>
+        [data-testid="stSidebar"] {
+            background-color: #3b0e0e; /* Dark Red Warning */
+        }
+        .stApp {
+            background-color: #1a0505; /* Very Dark Red */
+        }
+        </style>
+        """, unsafe_allow_html=True)
+    st.error("⚠️ **FAILURE DETECTED:** YOU DID NOT MOVE THE NEEDLE YESTERDAY. THE SYSTEM IS IN RED ALERT.")
+
 # 1. SIDEBAR
 with st.sidebar.expander("⚙️ Asset Manager"):
     tab1, tab2 = st.tabs(["Add", "Delist"])
@@ -277,56 +319,56 @@ with st.sidebar.expander("⚙️ Asset Manager"):
         del_task = st.selectbox("Select Asset to Delist", tasks_df['name'].tolist() if not tasks_df.empty else [])
         if st.button("Delist Asset"): manage_task("delete", del_task); st.rerun()
 
-# --- NEW: BOUNTY BOARD TAB ---
 with st.sidebar.expander("🏆 Bounty Board"):
     b_tab1, b_tab2 = st.tabs(["Post", "Claim"])
-    
-    with b_tab1: # CALCULATOR
-        st.caption("Valuation Model")
-        b_name = st.text_input("Bounty Name", placeholder="e.g. Ship News App")
+    with b_tab1: 
+        b_name = st.text_input("Bounty Name")
         b_hours = st.number_input("Est. Hours", 1, 100, 5)
-        
         col_b1, col_b2 = st.columns(2)
-        b_fear = col_b1.checkbox("High Fear?", help="+25% Value")
-        b_lev = col_b2.checkbox("Resume Item?", help="+50% Value")
-        
-        # VALUATION FORMULA
-        base_val = b_hours * 20
-        multiplier = 1.0
-        if b_fear: multiplier += 0.25
-        if b_lev: multiplier += 0.50
-        
-        final_val = int(base_val * multiplier)
+        b_fear = col_b1.checkbox("High Fear?", help="+25%")
+        b_lev = col_b2.checkbox("Resume?", help="+50%")
+        final_val = int((b_hours * 20) * (1.0 + (0.25 if b_fear else 0) + (0.50 if b_lev else 0)))
         st.metric("Fair Value", f"{final_val} PTS")
-        
         if st.button("Post Bounty"):
             if b_name: manage_bounty("add", b_name, final_val); st.rerun()
-            
-    with b_tab2: # CLAIM
+    with b_tab2: 
         open_bounties = get_open_bounties()
         if not open_bounties.empty:
             b_claim = st.selectbox("Select Bounty", open_bounties['name'] + " (" + open_bounties['value'].astype(str) + " pts)")
-            # Extract name back from string
             real_name = b_claim.split(" (")[0]
-            if st.button("💰 CLAIM REWARD"):
-                manage_bounty("claim", real_name)
-                st.rerun()
-        else:
-            st.info("No active bounties.")
+            if st.button("💰 CLAIM"): manage_bounty("claim", real_name); st.rerun()
+        else: st.info("No active bounties.")
 
-# EXAM MODE
 exam_active, exam_end = check_exam_mode()
 st.sidebar.divider()
 if exam_active:
     st.sidebar.error(f"🔥 EXAM MODE ACTIVE")
-    st.sidebar.caption(f"Ends: {exam_end.strftime('%b %d %H:%M')}")
 else:
     if st.sidebar.button("💀 Activate Exam Mode (-50 Pts)"):
-        activate_exam_mode()
+        activate_exam_mode(); st.rerun()
+
+# 2. THE GIANT NEEDLE TOGGLE
+st.sidebar.header("🚀 THE NEEDLE")
+st.sidebar.caption("Did you materially advance your life today?")
+
+if "needle_flipped" not in st.session_state: st.session_state.needle_flipped = False
+
+# We wrap the toggle in a container to visually separate it
+with st.sidebar.container(border=True):
+    if needle_today:
+        st.markdown("### ✅ MOVED")
+    else:
+        st.markdown("### ❌ STAGNANT")
+        
+    needle_input = st.toggle("Confirm Movement", value=needle_today, disabled=needle_today)
+
+    if needle_input and not needle_today:
+        set_needle_status(True)
         st.rerun()
 
-# 2. ORDER EXECUTION
+st.sidebar.divider()
 st.sidebar.header("📝 Execute Order")
+
 sleep_val = st.sidebar.slider("Sleep Last Night (Hrs)", 0.0, 12.0, 7.0, 0.5)
 
 tasks_df = get_active_tasks()
@@ -334,7 +376,6 @@ if not tasks_df.empty:
     tier_order = {"Core": 0, "Deep Work": 1, "Social": 2, "Rent": 3}
     tasks_df['sort_key'] = tasks_df['tier'].map(tier_order)
     tasks_df = tasks_df.sort_values(by=['sort_key', 'name'])
-
     def get_tier_icon(name):
         row = tasks_df[tasks_df['name'] == name]
         if not row.empty:
@@ -342,18 +383,13 @@ if not tasks_df.empty:
             mapping = {"Core": "🔴", "Deep Work": "🟣", "Social": "🟢", "Rent": "🔵"}
             return mapping.get(tier, "⚪")
         return "⚪"
-
     project_name = st.sidebar.selectbox("Asset", tasks_df['name'], format_func=lambda x: f"{get_tier_icon(x)} {x}")
     project_tier = tasks_df[tasks_df['name'] == project_name]['tier'].values[0]
-    
     social_subtype = None
     if project_tier == "Social":
         social_subtype = st.sidebar.radio("Type", ["Deep Convo / New People", "Hangout / Activity", "Casual Check-up"])
-        st.sidebar.info(f"Yield: {30 if 'Deep' in social_subtype else 15 if 'Hangout' in social_subtype else 5} pts")
-    else:
-        st.sidebar.caption(f"Class: {project_tier}")
-else:
-    project_name = None; project_tier = None
+    else: st.sidebar.caption(f"Class: {project_tier}")
+else: project_name = None; project_tier = None
 
 duration = st.sidebar.number_input("Duration (Mins)", min_value=0, step=10, value=20)
 notes = st.sidebar.text_input("Trade Notes", placeholder="Details?")
@@ -365,15 +401,17 @@ if st.sidebar.button("Log Session"):
         elif 0 <= datetime.now().hour < 6 and not exam_active: st.sidebar.error("🧛 VAMPIRE RULE")
         else: st.sidebar.warning("⚠️ No Points")
     else: st.sidebar.error("Create an asset first!")
-
-
-if st.sidebar.button("↩️ Undo Last Trade"):
-    undo_last_log()
-    st.rerun()
+    
+if st.sidebar.button("↩️ Undo Last Trade"): undo_last_log(); st.rerun()
 
 # --- DASHBOARD ---
 st.title("📈 The Discipline Portfolio")
 tokens_used, social_ema, current_rent, df = get_analytics()
+
+if needle_today:
+    st.success("##### 🚀 MISSION ACCOMPLISHED: THE NEEDLE WAS MOVED TODAY")
+elif not yesterday_status:
+    st.error("##### 🛑 CRITICAL FAILURE: YOU STAGNATED YESTERDAY. FIX IT.")
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -383,7 +421,6 @@ if not df.empty:
     core_projects = tasks_df[tasks_df['tier'] == 'Core']['name'].tolist()
     core_met = not today_df[(today_df['project'].isin(core_projects)) & (today_df['duration'] >= 20)].empty
     final_points = today_df['points'].sum() if core_met else 0
-    
     col1.metric("Today's Alpha", f"{final_points}", delta=f"Rent: {current_rent}", delta_color="inverse")
     if core_met: col2.success("✅ GATEKEEPER OPEN")
     else: col2.error("🔒 GATEKEEPER CLOSED")
@@ -429,19 +466,15 @@ with tab2:
         start_date = df['timestamp'].min().date() - timedelta(days=df['timestamp'].min().date().weekday())
         end_date = date.today()
         all_dates = pd.date_range(start_date, end_date)
-        
         daily_intensity = df.groupby(df['timestamp'].dt.date)['duration'].sum().reindex(all_dates, fill_value=0).reset_index()
         daily_intensity.columns = ['date', 'duration']
         daily_intensity['week_start'] = daily_intensity['date'] - pd.to_timedelta(daily_intensity['date'].dt.dayofweek, unit='D')
         daily_intensity['day_num'] = daily_intensity['date'].dt.dayofweek
         
         fig_hm = go.Figure(data=go.Heatmap(
-            x=daily_intensity['week_start'], 
-            y=daily_intensity['day_num'],
-            z=daily_intensity['duration'],
+            x=daily_intensity['week_start'], y=daily_intensity['day_num'], z=daily_intensity['duration'],
             colorscale=[[0, '#ebedf0'], [0.01, '#9be9a8'], [1.0, '#216e39']],
-            showscale=False, xgap=3, ygap=3, hoverongaps=False,
-            hovertemplate='%{x}<br>%{z} mins<extra></extra>'
+            showscale=False, xgap=3, ygap=3, hoverongaps=False, hovertemplate='%{x}<br>%{z} mins<extra></extra>'
         ))
         fig_hm.update_layout(
             height=200, margin=dict(l=20, r=20, t=20, b=20),
@@ -455,5 +488,4 @@ with tab2:
 
 st.divider()
 st.subheader("Transaction Ledger")
-if not df.empty:
-    st.dataframe(df.sort_values(by='timestamp', ascending=False).head(5), use_container_width=True)
+if not df.empty: st.dataframe(df.sort_values(by='timestamp', ascending=False).head(5), use_container_width=True)
