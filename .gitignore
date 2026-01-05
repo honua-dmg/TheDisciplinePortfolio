@@ -19,7 +19,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
+.venv/
 # Database - these are the files you should NOT commit
 *.db
 *.sqlite3

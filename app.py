@@ -16,6 +16,8 @@ SOCIAL_EMA_TARGET = 8.0
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    
+    # 1. Create Tables
     c.execute('''CREATE TABLE IF NOT EXISTS logs 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   timestamp TEXT, 
@@ -34,8 +36,17 @@ def init_db():
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   name TEXT UNIQUE, 
                   value INTEGER, 
-                  status TEXT)''') 
+                  status TEXT,
+                  end_goal TEXT)''') # Added end_goal column definition for new files
     
+    # 2. AUTO-MIGRATION (For your existing DB)
+    # This tries to add the column. If it exists, it ignores the error.
+    try:
+        c.execute("ALTER TABLE bounties ADD COLUMN end_goal TEXT")
+    except sqlite3.OperationalError:
+        pass 
+    
+    # 3. Seed Defaults
     c.execute("SELECT count(*) FROM tasks")
     if c.fetchone()[0] == 0:
         defaults = [
@@ -89,7 +100,7 @@ def check_needle_status(target_date=None):
     conn.close()
     
     if df.empty: return False
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
     log = df[df['timestamp'].dt.date == target_date]
     return not log.empty
 
@@ -106,12 +117,14 @@ def set_needle_status(state):
         st.toast("🚀 BOOM! NEEDLE MOVED!", icon="🔥")
 
 # --- BOUNTY SYSTEM ---
-def manage_bounty(action, name=None, value=0):
+def manage_bounty(action, name=None, value=0, end_goal=None):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     if action == "add":
         try:
-            c.execute("INSERT INTO bounties (name, value, status) VALUES (?, ?, 'Open')", (name, value))
+            # Insert with new End Goal
+            c.execute("INSERT INTO bounties (name, value, status, end_goal) VALUES (?, ?, 'Open', ?)", 
+                      (name, value, end_goal))
             st.toast(f"Bounty '{name}' Posted: {value} PTS", icon="💎")
         except sqlite3.IntegrityError:
             st.error("Bounty name already exists!")
@@ -131,7 +144,8 @@ def manage_bounty(action, name=None, value=0):
 
 def get_open_bounties():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql("SELECT name, value FROM bounties WHERE status='Open'", conn)
+    # Fetch end_goal as well
+    df = pd.read_sql("SELECT name, value, end_goal FROM bounties WHERE status='Open'", conn)
     conn.close()
     return df
 
@@ -143,7 +157,7 @@ def check_exam_mode():
     except: return False, None
     conn.close()
     if df.empty: return False, None
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
     last_activation = df['timestamp'].max()
     if datetime.now() < (last_activation + timedelta(hours=72)):
         return True, last_activation + timedelta(hours=72)
@@ -180,7 +194,7 @@ def get_analytics():
 
     if df.empty: return 0, 0, BASE_RENT, df
 
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
     
     tasks_df = get_active_tasks()
     deep_work_projects = tasks_df[tasks_df['tier'] == 'Deep Work']['name'].tolist()
@@ -240,7 +254,7 @@ def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
     expected_columns = ['timestamp', 'project', 'duration', 'points', 'notes']
     if df.empty: project_logs = pd.DataFrame(columns=expected_columns)
     else:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
         today_logs = df[df['timestamp'].dt.date == date.today()]
         project_logs = today_logs[today_logs['project'] == project]
 
@@ -288,19 +302,18 @@ def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
 st.set_page_config(page_title="Discipline Portfolio", page_icon="📈", layout="wide")
 init_db()
 
-# --- THE SHAME PROTOCOL (COLOR SCHEME LOGIC) ---
+# --- THE SHAME PROTOCOL ---
 yesterday_status = check_needle_status(date.today() - timedelta(days=1))
 needle_today = check_needle_status(date.today())
 
-# If you failed yesterday, INJECT RED CSS
 if not yesterday_status:
     st.markdown("""
         <style>
         [data-testid="stSidebar"] {
-            background-color: #3b0e0e; /* Dark Red Warning */
+            background-color: #3b0e0e; 
         }
         .stApp {
-            background-color: #1a0505; /* Very Dark Red */
+            background-color: #1a0505; 
         }
         </style>
         """, unsafe_allow_html=True)
@@ -323,6 +336,7 @@ with st.sidebar.expander("🏆 Bounty Board"):
     b_tab1, b_tab2 = st.tabs(["Post", "Claim"])
     with b_tab1: 
         b_name = st.text_input("Bounty Name")
+        b_goal = st.text_area("Definition of Done", placeholder="e.g. Code passes all unit tests, deployed to prod.")
         b_hours = st.number_input("Est. Hours", 1, 100, 5)
         col_b1, col_b2 = st.columns(2)
         b_fear = col_b1.checkbox("High Fear?", help="+25%")
@@ -330,12 +344,21 @@ with st.sidebar.expander("🏆 Bounty Board"):
         final_val = int((b_hours * 20) * (1.0 + (0.25 if b_fear else 0) + (0.50 if b_lev else 0)))
         st.metric("Fair Value", f"{final_val} PTS")
         if st.button("Post Bounty"):
-            if b_name: manage_bounty("add", b_name, final_val); st.rerun()
+            if b_name: manage_bounty("add", b_name, final_val, b_goal); st.rerun()
     with b_tab2: 
         open_bounties = get_open_bounties()
         if not open_bounties.empty:
-            b_claim = st.selectbox("Select Bounty", open_bounties['name'] + " (" + open_bounties['value'].astype(str) + " pts)")
-            real_name = b_claim.split(" (")[0]
+            # Dropdown with name + points
+            b_claim_idx = st.selectbox("Select Bounty", range(len(open_bounties)), format_func=lambda x: f"{open_bounties.iloc[x]['name']} ({open_bounties.iloc[x]['value']} pts)")
+            
+            # Show the selected bounty's details
+            selected_row = open_bounties.iloc[b_claim_idx]
+            real_name = selected_row['name']
+            condition = selected_row['end_goal'] if selected_row['end_goal'] else "No condition specified."
+            
+            # THE NEW BOX
+            st.warning(f"**🎯 Condition:** {condition}")
+            
             if st.button("💰 CLAIM"): manage_bounty("claim", real_name); st.rerun()
         else: st.info("No active bounties.")
 
@@ -353,7 +376,6 @@ st.sidebar.caption("Did you materially advance your life today?")
 
 if "needle_flipped" not in st.session_state: st.session_state.needle_flipped = False
 
-# We wrap the toggle in a container to visually separate it
 with st.sidebar.container(border=True):
     if needle_today:
         st.markdown("### ✅ MOVED")
@@ -416,7 +438,7 @@ elif not yesterday_status:
 col1, col2, col3, col4 = st.columns(4)
 
 if not df.empty:
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
     today_df = df[df['timestamp'].dt.date == date.today()]
     core_projects = tasks_df[tasks_df['tier'] == 'Core']['name'].tolist()
     core_met = not today_df[(today_df['project'].isin(core_projects)) & (today_df['duration'] >= 20)].empty
@@ -438,53 +460,84 @@ tab1, tab2 = st.tabs(["💰 Equity Curve", "🔥 Consistency Heatmap"])
 
 with tab1:
     if not df.empty:
+        chart_tasks = get_active_tasks()
+        chart_core = chart_tasks[chart_tasks['tier'] == 'Core']['name'].tolist()
+
+        df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
         daily_groups = df.groupby(df['timestamp'].dt.date)
-        daily_data = {}
+        daily_revenue = {}
+        
         for day, group in daily_groups:
-            day_core_met = not group[(group['project'].isin(core_projects)) & (group['duration'] >= 20)].empty
-            daily_data[day] = group['points'].sum() if day_core_met else 0
+            day_core_met = not group[
+                (group['project'].isin(chart_core)) & 
+                (group['duration'] >= 20)
+            ].empty
+            total_pts = group['points'].sum()
+            if day_core_met: daily_revenue[day] = total_pts
+            else: daily_revenue[day] = 0 
 
         start_date = df['timestamp'].min().date()
         end_date = date.today()
+        
+        if pd.isna(start_date): start_date = end_date
+        all_days = pd.date_range(start_date, end_date).date 
+        
         chart_rows = []
         cumulative_equity = 0
-        for single_date in pd.date_range(start_date, end_date):
-            d = single_date.date()
-            net = daily_data.get(d, 0) - BASE_RENT
+        
+        for d in all_days:
+            rev = daily_revenue.get(d, 0)
+            net = rev - BASE_RENT
             cumulative_equity += net
-            chart_rows.append({'date': d, 'Equity': cumulative_equity})
+            chart_rows.append({'Date': d, 'Equity': cumulative_equity})
             
         chart_df = pd.DataFrame(chart_rows)
+        
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=chart_df['date'], y=chart_df['Equity'], mode='lines+markers', fill='tozeroy', line=dict(color='#00CC96', width=3)))
+        fig.add_trace(go.Scatter(
+            x=chart_df['Date'], y=chart_df['Equity'], 
+            mode='lines+markers', fill='tozeroy', 
+            line=dict(color='#00CC96', width=3), name="Net Worth"
+        ))
         fig.add_hline(y=0, line_dash="dot", line_color="red")
         st.plotly_chart(fig, use_container_width=True)
-
+            
 with tab2:
     if not df.empty:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        start_date = df['timestamp'].min().date() - timedelta(days=df['timestamp'].min().date().weekday())
-        end_date = date.today()
-        all_dates = pd.date_range(start_date, end_date)
-        daily_intensity = df.groupby(df['timestamp'].dt.date)['duration'].sum().reindex(all_dates, fill_value=0).reset_index()
-        daily_intensity.columns = ['date', 'duration']
-        daily_intensity['week_start'] = daily_intensity['date'] - pd.to_timedelta(daily_intensity['date'].dt.dayofweek, unit='D')
-        daily_intensity['day_num'] = daily_intensity['date'].dt.dayofweek
-        
-        fig_hm = go.Figure(data=go.Heatmap(
-            x=daily_intensity['week_start'], y=daily_intensity['day_num'], z=daily_intensity['duration'],
-            colorscale=[[0, '#ebedf0'], [0.01, '#9be9a8'], [1.0, '#216e39']],
-            showscale=False, xgap=3, ygap=3, hoverongaps=False, hovertemplate='%{x}<br>%{z} mins<extra></extra>'
-        ))
-        fig_hm.update_layout(
-            height=200, margin=dict(l=20, r=20, t=20, b=20),
-            xaxis=dict(showgrid=False, zeroline=False, tickformat='%b %d'),
-            yaxis=dict(tickmode='array', tickvals=[0,1,2,3,4,5,6], ticktext=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'], showgrid=False, zeroline=False, autorange="reversed"),
-            plot_bgcolor='rgba(0,0,0,0)', yaxis_scaleanchor="x"
-        )
-        st.plotly_chart(fig_hm, use_container_width=True)
-    else:
-        st.info("Log data to see heatmap.")
+        try:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
+            daily_intensity = df.groupby(df['timestamp'].dt.date)['duration'].sum().reset_index()
+            daily_intensity.columns = ['date', 'duration']
+            
+            start_date = df['timestamp'].min().date()
+            if pd.isna(start_date): start_date = date.today()
+            start_date = start_date - timedelta(days=start_date.weekday())
+            end_date = date.today()
+            
+            full_range = pd.date_range(start_date, end_date).date
+            grid_df = pd.DataFrame({'date': full_range})
+            hm_df = pd.merge(grid_df, daily_intensity, on='date', how='left').fillna(0)
+            
+            hm_df['dt'] = pd.to_datetime(hm_df['date'])
+            hm_df['week_start'] = hm_df['dt'] - pd.to_timedelta(hm_df['dt'].dt.dayofweek, unit='D')
+            hm_df['day_num'] = hm_df['dt'].dt.dayofweek
+            
+            fig_hm = go.Figure(data=go.Heatmap(
+                x=hm_df['week_start'], y=hm_df['day_num'], z=hm_df['duration'],
+                colorscale=[[0, '#ebedf0'], [0.001, '#9be9a8'], [1.0, '#216e39']], 
+                showscale=False, xgap=3, ygap=3, 
+                hoverongaps=False, hovertemplate='%{x}<br>%{z} mins<extra></extra>'
+            ))
+            fig_hm.update_layout(
+                height=200, margin=dict(l=20, r=20, t=20, b=20),
+                xaxis=dict(showgrid=False, zeroline=False, tickformat='%b %d'),
+                yaxis=dict(tickmode='array', tickvals=[0,1,2,3,4,5,6], ticktext=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'], 
+                           showgrid=False, zeroline=False, autorange="reversed"),
+                plot_bgcolor='rgba(0,0,0,0)', yaxis_scaleanchor="x"
+            )
+            st.plotly_chart(fig_hm, use_container_width=True)
+        except Exception as e: st.error(f"Heatmap Error: {e}")
+    else: st.info("Log data to see heatmap.")
 
 st.divider()
 st.subheader("Transaction Ledger")
