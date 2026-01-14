@@ -1,6 +1,5 @@
 streamlit
 pandas
-sqlite3
 plotly
-shutil
-os
+python-dotenv
+psycopg2-binary

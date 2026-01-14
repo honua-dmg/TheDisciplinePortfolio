@@ -5,6 +5,17 @@ import plotly.graph_objects as go
 import shutil
 import os
 from datetime import datetime, date, timedelta
+# db.py
+import psycopg2
+import dotenv
+dotenv.load_dotenv()
+
+
+def get_conn():
+    return psycopg2.connect(
+        os.getenv("DATABASE_URL"),
+        sslmode="require"
+    )
 
 # --- CONFIGURATION ---
 DB_FILE = "portfolio.db"
@@ -14,7 +25,7 @@ SOCIAL_EMA_TARGET = 8.0
 
 # --- DATABASE ENGINE ---
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     c = conn.cursor()
     
     # 1. Create Tables
