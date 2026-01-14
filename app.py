@@ -1,64 +1,65 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
-import plotly.graph_objects as go
-import shutil
-import os
-from datetime import datetime, date, timedelta
-# db.py
 import psycopg2
 import dotenv
+import os
+import shutil
+from datetime import datetime, date, timedelta
+
 dotenv.load_dotenv()
 
-
 def get_conn():
-    return psycopg2.connect(
-        os.getenv("DATABASE_URL"),
-        sslmode="require"
-    )
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL not set in environment")
+    return psycopg2.connect(db_url, sslmode="require")
 
 # --- CONFIGURATION ---
-DB_FILE = "portfolio.db"
-WEEKLY_TOKEN_CAP = 6  
-BASE_RENT = 30 
-SOCIAL_EMA_TARGET = 8.0 
+WEEKLY_TOKEN_CAP = 6
+BASE_RENT = 30
+SOCIAL_EMA_TARGET = 8.0
 
 # --- DATABASE ENGINE ---
+@st.cache_resource
 def init_db():
     conn = get_conn()
     c = conn.cursor()
+
+    # --- TABLES ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        timestamp TIMESTAMP,
+        project TEXT,
+        duration INTEGER,
+        points INTEGER,
+        notes TEXT
+    )
+    """)
     
-    # 1. Create Tables
-    c.execute('''CREATE TABLE IF NOT EXISTS logs 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp TEXT, 
-                  project TEXT, 
-                  duration INTEGER, 
-                  points INTEGER,
-                  notes TEXT)''')
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name TEXT UNIQUE,
+        tier TEXT,
+        active BOOLEAN DEFAULT TRUE
+    )
+    """)
     
-    c.execute('''CREATE TABLE IF NOT EXISTS tasks 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  name TEXT UNIQUE, 
-                  tier TEXT, 
-                  active BOOLEAN)''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS bounties 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  name TEXT UNIQUE, 
-                  value INTEGER, 
-                  status TEXT,
-                  end_goal TEXT)''') # Added end_goal column definition for new files
-    
-    # 2. AUTO-MIGRATION (For your existing DB)
-    # This tries to add the column. If it exists, it ignores the error.
-    try:
-        c.execute("ALTER TABLE bounties ADD COLUMN end_goal TEXT")
-    except sqlite3.OperationalError:
-        pass 
-    
-    # 3. Seed Defaults
-    c.execute("SELECT count(*) FROM tasks")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS bounties (
+        id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name TEXT UNIQUE,
+        value INTEGER,
+        status TEXT DEFAULT 'Open',
+        end_goal TEXT
+    )
+    """)
+
+    conn.commit()
+
+    # --- SEED DEFAULT TASKS ---
+    c.execute("SELECT COUNT(*) FROM tasks")
     if c.fetchone()[0] == 0:
         defaults = [
             ("News App", "Core"),
@@ -67,248 +68,265 @@ def init_db():
             ("Adversarial DL", "Deep Work"),
             ("Academics", "Rent"),
             ("Volleyball", "Rent"),
-            ("Social Life", "Social") 
+            ("Social Life", "Social")
         ]
-        c.executemany("INSERT INTO tasks (name, tier, active) VALUES (?, ?, 1)", defaults)
+        for name, tier in defaults:
+            c.execute("INSERT INTO tasks (name, tier, active) VALUES (%s, %s, TRUE) ON CONFLICT (name) DO NOTHING", (name, tier))
         conn.commit()
-    conn.commit()
+
+    c.close()
     conn.close()
-    
-    if not os.path.exists("backups"): os.makedirs("backups")
-    today_str = date.today().strftime("%Y-%m-%d")
-    backup_path = f"backups/portfolio_{today_str}.db"
-    if os.path.exists(DB_FILE) and not os.path.exists(backup_path):
-        shutil.copy(DB_FILE, backup_path)
+
 
 def get_active_tasks():
-    conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql("SELECT name, tier FROM tasks WHERE active=1", conn)
+    conn = get_conn()
+    df = pd.read_sql("SELECT name, tier FROM tasks WHERE active=TRUE", conn)
     conn.close()
     return df
 
 def manage_task(action, name=None, tier=None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     c = conn.cursor()
     if action == "add":
         try:
-            c.execute("INSERT INTO tasks (name, tier, active) VALUES (?, ?, 1)", (name, tier))
+            c.execute("INSERT INTO tasks (name, tier, active) VALUES (%s, %s, TRUE) ON CONFLICT (name) DO NOTHING", (name, tier))
             st.toast(f"Asset '{name}' IPO'd successfully!", icon="🔔")
-        except sqlite3.IntegrityError:
-            st.error("Asset already exists!")
+        except Exception as e:
+            st.error(f"Error adding asset: {e}")
     elif action == "delete":
-        c.execute("DELETE FROM tasks WHERE name=?", (name,))
+        c.execute("DELETE FROM tasks WHERE name=%s", (name,))
         st.toast(f"Asset '{name}' Delisted.", icon="🗑️")
     conn.commit()
+    c.close()
     conn.close()
-
-# --- NEEDLE MOVER LOGIC ---
-def check_needle_status(target_date=None):
-    if target_date is None: target_date = date.today()
-    conn = sqlite3.connect(DB_FILE)
-    try:
-        df = pd.read_sql("SELECT * FROM logs WHERE project='System' AND notes='Needle Moved'", conn)
-    except: return False
-    conn.close()
-    
-    if df.empty: return False
-    df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
-    log = df[df['timestamp'].dt.date == target_date]
-    return not log.empty
-
-def set_needle_status(state):
-    if state:
-        timestamp_str = datetime.now().isoformat()
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
-                  (timestamp_str, "System", 0, 0, "Needle Moved"))
-        conn.commit()
-        conn.close()
-        st.balloons()
-        st.toast("🚀 BOOM! NEEDLE MOVED!", icon="🔥")
 
 # --- BOUNTY SYSTEM ---
 def manage_bounty(action, name=None, value=0, end_goal=None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     c = conn.cursor()
     if action == "add":
         try:
-            # Insert with new End Goal
-            c.execute("INSERT INTO bounties (name, value, status, end_goal) VALUES (?, ?, 'Open', ?)", 
+            c.execute("INSERT INTO bounties (name, value, end_goal) VALUES (%s, %s, %s) ON CONFLICT (name) DO NOTHING",
                       (name, value, end_goal))
             st.toast(f"Bounty '{name}' Posted: {value} PTS", icon="💎")
-        except sqlite3.IntegrityError:
-            st.error("Bounty name already exists!")
+        except Exception as e:
+            st.error(f"Bounty add error: {e}")
     elif action == "claim":
-        c.execute("UPDATE bounties SET status='Claimed' WHERE name=?", (name,))
-        c.execute("SELECT value FROM bounties WHERE name=?", (name,))
+        c.execute("UPDATE bounties SET status='Claimed' WHERE name=%s", (name,))
+        c.execute("SELECT value FROM bounties WHERE name=%s", (name,))
         val = c.fetchone()[0]
         timestamp_str = datetime.now().isoformat()
-        c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
+        c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (%s, %s, %s, %s, %s)",
                   (timestamp_str, "Bounty Hunt", 0, val, f"CLAIMED: {name}"))
         st.balloons()
         st.success(f"💰 BOUNTY CLAIMED: +{val} PTS")
     elif action == "delete":
-        c.execute("DELETE FROM bounties WHERE name=?", (name,))
+        c.execute("DELETE FROM bounties WHERE name=%s", (name,))
     conn.commit()
+    c.close()
     conn.close()
 
 def get_open_bounties():
-    conn = sqlite3.connect(DB_FILE)
-    # Fetch end_goal as well
+    conn = get_conn()
     df = pd.read_sql("SELECT name, value, end_goal FROM bounties WHERE status='Open'", conn)
     conn.close()
     return df
 
-# --- BOSS BATTLE LOGIC ---
-def check_exam_mode():
-    conn = sqlite3.connect(DB_FILE)
+
+# --- NEEDLE MOVER LOGIC ---
+def check_needle_status(target_date=None):
+    if target_date is None: target_date = date.today()
+    conn = get_conn()
     try:
-        df = pd.read_sql("SELECT * FROM logs WHERE project='System' AND notes='Exam Mode Activated'", conn)
-    except: return False, None
+        df = pd.read_sql(
+            "SELECT * FROM logs WHERE project='System' AND notes='Needle Moved'", conn
+        )
+    except:
+        conn.close()
+        return False
     conn.close()
+    
+    if df.empty: return False
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    log = df[df['timestamp'].dt.date == target_date]
+    return not log.empty
+
+
+def set_needle_status(state):
+    if state:
+        timestamp_str = datetime.now().isoformat()
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (%s, %s, %s, %s, %s)",
+            (timestamp_str, "System", 0, 0, "Needle Moved")
+        )
+        conn.commit()
+        c.close()
+        conn.close()
+        st.balloons()
+        st.toast("🚀 BOOM! NEEDLE MOVED!", icon="🔥")
+
+
+# --- BOSS BATTLE LOGIC ---
+
+def check_exam_mode():
+    conn = get_conn()
+    try:
+        df = pd.read_sql(
+            "SELECT * FROM logs WHERE project='System' AND notes='Exam Mode Activated'", conn
+        )
+    except:
+        conn.close()
+        return False, None
+    conn.close()
+    
     if df.empty: return False, None
-    df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
     last_activation = df['timestamp'].max()
     if datetime.now() < (last_activation + timedelta(hours=72)):
         return True, last_activation + timedelta(hours=72)
     return False, None
 
+
 def activate_exam_mode():
     timestamp_str = datetime.now().isoformat()
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
-              (timestamp_str, "System", 0, -50, "Exam Mode Activated"))
+    c.execute(
+        "INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (%s, %s, %s, %s, %s)",
+        (timestamp_str, "System", 0, -50, "Exam Mode Activated")
+    )
     conn.commit()
+    c.close()
     conn.close()
 
+
 def undo_last_log():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT project, points FROM logs ORDER BY id DESC LIMIT 1")
+    c.execute("SELECT project, points, id FROM logs ORDER BY id DESC LIMIT 1")
     last_row = c.fetchone()
     if last_row:
-        c.execute("DELETE FROM logs WHERE id = (SELECT MAX(id) FROM logs)")
+        last_id = last_row[2]
+        c.execute("DELETE FROM logs WHERE id=%s", (last_id,))
         conn.commit()
         st.toast(f"Reverted: {last_row[0]} ({last_row[1]} pts)", icon="↩️")
     else:
         st.error("Ledger is empty.")
+    c.close()
     conn.close()
+
 
 # --- ANALYTICS ENGINE ---
 def get_analytics():
-    conn = sqlite3.connect(DB_FILE)
-    try: df = pd.read_sql("SELECT * FROM logs", conn)
-    except: df = pd.DataFrame(columns=['timestamp', 'project', 'duration', 'points', 'notes'])
+    conn = get_conn()
+    try:
+        df = pd.read_sql("SELECT * FROM logs", conn)
+    except:
+        df = pd.DataFrame(columns=['timestamp', 'project', 'duration', 'points', 'notes'])
     conn.close()
 
     if df.empty: return 0, 0, BASE_RENT, df
 
-    df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
-    
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
     tasks_df = get_active_tasks()
     deep_work_projects = tasks_df[tasks_df['tier'] == 'Deep Work']['name'].tolist()
     social_projects = tasks_df[tasks_df['tier'] == 'Social']['name'].tolist()
-    
+
     today = date.today()
     start_of_week = pd.to_datetime(today - timedelta(days=today.weekday()))
     this_week = df[df['timestamp'] >= start_of_week]
-    
+
     tokens = this_week[
-        (this_week['project'].isin(deep_work_projects)) & 
+        (this_week['project'].isin(deep_work_projects)) &
         (this_week['duration'] >= 90)
     ].shape[0]
 
     social_logs = df[df['project'].isin(social_projects)].copy()
-    daily_social = social_logs.groupby(social_logs['timestamp'].dt.date)['points'].sum().reset_index()
-    all_dates = pd.date_range(start=df['timestamp'].min().date(), end=today)
-    daily_social.set_index('timestamp', inplace=True)
-    daily_social = daily_social.reindex(all_dates, fill_value=0)
-    daily_social['EMA'] = daily_social['points'].ewm(span=7).mean()
-    current_social_ema = daily_social['EMA'].iloc[-1] if not daily_social.empty else 0
-    
+    if not social_logs.empty:
+        daily_social = social_logs.groupby(social_logs['timestamp'].dt.date)['points'].sum().reindex(
+            pd.date_range(start=df['timestamp'].min().date(), end=today), fill_value=0
+        )
+        daily_social = daily_social.to_frame('points')
+        daily_social['EMA'] = daily_social['points'].ewm(span=7).mean()
+        current_social_ema = daily_social['EMA'].iloc[-1]
+    else:
+        current_social_ema = 0
+
     current_rent = BASE_RENT
     if current_social_ema < (SOCIAL_EMA_TARGET / 2): current_rent = int(BASE_RENT * 1.5)
     elif current_social_ema < SOCIAL_EMA_TARGET: current_rent = int(BASE_RENT * 1.2)
-        
+
     return tokens, current_social_ema, current_rent, df
 
+
+# --- LOG WORK ---
 def log_work(project, duration, notes, tier, sleep_hours, social_subtype=None):
     points = 0
     current_hour = datetime.now().hour
     is_exam_mode, _ = check_exam_mode()
-    
+
     multiplier = 1.0
     if sleep_hours < 5: multiplier = 0.5; notes += " (ZOMBIE TAX -50%)"
     elif sleep_hours < 6.5: multiplier = 0.8; notes += " (TIRED TAX -20%)"
-    
+
     is_vampire_time = (0 <= current_hour < 6)
     is_exempt_activity = (tier == 'Social') or (project == 'Volleyball')
     if is_exam_mode: is_vampire_time = False
 
     if is_vampire_time and not is_exempt_activity:
         timestamp_str = datetime.now().isoformat()
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_conn()
         c = conn.cursor()
-        c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
-                  (timestamp_str, project, duration, 0, f"{notes} (VAMPIRE PENALTY)"))
+        c.execute(
+            "INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (%s, %s, %s, %s, %s)",
+            (timestamp_str, project, duration, 0, f"{notes} (VAMPIRE PENALTY)")
+        )
         conn.commit()
+        c.close()
         conn.close()
-        return 0 
+        return 0
 
-    conn = sqlite3.connect(DB_FILE)
-    try: df = pd.read_sql("SELECT * FROM logs", conn)
-    except: df = pd.DataFrame()
+    # Fetch today's logs
+    conn = get_conn()
+    df = pd.read_sql("SELECT * FROM logs WHERE project=%s", conn, params=(project,))
     conn.close()
-    
-    expected_columns = ['timestamp', 'project', 'duration', 'points', 'notes']
-    if df.empty: project_logs = pd.DataFrame(columns=expected_columns)
-    else:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
-        today_logs = df[df['timestamp'].dt.date == date.today()]
-        project_logs = today_logs[today_logs['project'] == project]
 
+    today_logs = df[df['timestamp'].dt.date == date.today()] if not df.empty else pd.DataFrame()
+    
     if tier == "Core":
-        already_collected_base = not project_logs[(project_logs['points'] >= 10)].empty
+        already_collected_base = not today_logs[(today_logs['points'] >= 10)].empty
         if duration >= 20 and not already_collected_base:
             points += 10
-            if current_hour < 17: points += 5 
-        current_total = project_logs['duration'].sum() + duration
-        prev_total = project_logs['duration'].sum()
-        if current_total >= 90 and prev_total < 90: points += 15 
-
+            if current_hour < 17: points += 5
+        current_total = today_logs['duration'].sum() + duration if not today_logs.empty else duration
+        prev_total = today_logs['duration'].sum() if not today_logs.empty else 0
+        if current_total >= 90 and prev_total < 90: points += 15
     elif tier == "Deep Work":
-        if duration >= 90: points = 30
-        else: points = 5
-
+        points = 30 if duration >= 90 else 5
     elif tier == "Rent":
-        if project_logs.empty: 
-            if project == "Volleyball": points = 25 
-            else: 
-                if is_exam_mode and project == "Academics": points = 20; notes += " (EXAM SURGE)"
-                else: points = 10
-            
+        if today_logs.empty:
+            points = 25 if project == "Volleyball" else (20 if is_exam_mode and project=="Academics" else 10)
     elif tier == "Social":
-        base_social_pts = 0
-        if social_subtype == "Deep Convo / New People": base_social_pts = 30
-        elif social_subtype == "Hangout / Activity": base_social_pts = 15
-        elif social_subtype == "Casual Check-up": base_social_pts = 5
-        
-        today_social = today_logs[today_logs['project'] == project]['points'].sum()
-        if today_social < 40: points = base_social_pts
-        else: points = 0; notes += " (Social Cap Hit)"
+        base_social_pts = {"Deep Convo / New People":30, "Hangout / Activity":15, "Casual Check-up":5}.get(social_subtype,0)
+        today_social = today_logs['points'].sum() if not today_logs.empty else 0
+        points = base_social_pts if today_social < 40 else 0; notes += " (Social Cap Hit)" if today_social >= 40 else ""
 
     final_points = int(points * multiplier)
     timestamp_str = datetime.now().isoformat()
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (?, ?, ?, ?, ?)", 
-              (timestamp_str, project, duration, final_points, notes))
-    conn.commit()
-    conn.close()
-    return final_points
 
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO logs (timestamp, project, duration, points, notes) VALUES (%s, %s, %s, %s, %s)",
+        (timestamp_str, project, duration, final_points, notes)
+    )
+    conn.commit()
+    c.close()
+    conn.close()
+
+    return final_points
 # --- UI LAYOUT ---
 st.set_page_config(page_title="Discipline Portfolio", page_icon="📈", layout="wide")
 init_db()
